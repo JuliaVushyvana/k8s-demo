@@ -449,10 +449,281 @@ $ kubectl get events -n k8s-demo --sort-by=.metadata.creationTimestamp | grep -E
 
 **d. Оновлення конфігурації з env-змінних ConfigMap.** Env читаються лише під час старту контейнера, тому після `kubectl apply -f k8s/configmap.yaml` потрібен `kubectl rollout restart deployment/k8s-demo-api -n k8s-demo` (і `kubectl rollout status` для контролю) — rolling update створить нові Pod-и з новими значеннями без простою. Надійніше автоматизувати: хеш ConfigMap в анотації шаблону Pod-а або ConfigMap з новим ім'ям на кожну версію (Kustomize `configMapGenerator`, Helm `checksum/config`), щоб зміна конфігурації сама запускала rollout і була в історії ревізій.
 
-**e. (рівень 100)** — див. розділ 100 (Розробник 2).
+**e. Міграція власного сервісу (рівень 100).** Бекенд StudySwap уже мав Dockerfile (двоетапна збірка на `node:22-bookworm-slim`), тому міграція звелася до: зібрати образ `studyswap-api:1.0.0` і перевірити `curl /health` у Docker → завантажити образ у Minikube (`minikube image load`, `imagePullPolicy: IfNotPresent`) → описати ConfigMap, PVC, Deployment і Service у `k8s/studyswap-*.yaml`, а `JWT_SECRET` передати через Secret, створений командою → `kubectl apply` у namespace `k8s-demo` → перевірити через `kubectl port-forward svc/studyswap-api 8082:80` і `curl /health`, `/materials`. Відмінності від демо k8s-demo:
+- **Стан і репліки.** Демо — stateless, 2 репліки з RollingUpdate. StudySwap зберігає дані у файлі SQLite, у який може писати лише один процес, тому 1 репліка, `strategy: Recreate` і PVC `ReadWriteOnce` (`/app/data`), щоб база й файли переживали перезапуск Pod-а. Масштабувати до 2–3 реплік можна після переходу на PostgreSQL.
+- **Перевірки.** У демо окремі `/healthz` і `/ready`. У StudySwap один `/health`, який перевіряє й базу, тому він використаний лише для readiness, а liveness — `tcpSocket :3000`, щоб збій бази не викликав рестартів.
+- **Образ.** Демо бере образ `maxnavrotsky/k8s-demo-app` з Docker Hub (або `minikube image build`); образ StudySwap локальний, тому `minikube image load`. Порт 3000 замість 8080, Node.js 22 замість 20 (вимога `better-sqlite3` 13).
+- **Конфігурація.** Замість `APP_MODE` у ConfigMap — реальні налаштування сервісу (`DB_FILE`, `FILES_DIR`, `RATE_LIMIT_MAX`); дію `rollout restart` видно за поведінкою: після зміни `RATE_LIMIT_MAX` 50 → 3 четвертий запит отримує `429`. Секрет — не в git (`secret.yaml` у демо), а через `kubectl create secret`.
+- **Завершення.** `server.js` StudySwap не обробляє SIGTERM, тому `terminationGracePeriodSeconds: 10`, щоб rollout не чекав 30 с.
 
 ---
 
 ## 100 балів: StudySwap у Kubernetes
 
-_Розділ заповнює Розробник 2._
+Середовище: Windows 11 Pro 26H2, Docker Desktop, Minikube 1.39.0 (Kubernetes 1.37.0, runtime containerd 2.3.4), PowerShell 5.1.
+
+Мета — запустити в кластері не демо-сервіс, а бекенд нашого проєкту StudySwap (Express 5 + SQLite) з репозиторію [JuliaVushyvana/StudySwap](https://github.com/JuliaVushyvana/StudySwap) за схемою з практичної 9 ([docs/practice9](https://github.com/JuliaVushyvana/StudySwap/tree/main/docs/practice9)).
+
+**Сервіс.** StudySwap — веб-платформа для обміну навчальними матеріалами між студентами: пошук конспектів і лабораторних за предметом, курсом і закладом освіти, завантаження та перегляд файлів, коментарі, скарги, ролі користувачів. У Kubernetes розгортається бекенд — REST API на Node.js 22 + Express 5 з базою SQLite. Основні ендпоінти: `GET /health` (стан сервера й бази), `GET /materials` (каталог із пошуком і фільтрами), `GET /materials/{id}`, `POST /auth/login`, `POST /materials`.
+
+Нові маніфести в `k8s/`:
+
+| Файл | Що описує |
+|---|---|
+| `studyswap-configmap.yaml` | ConfigMap `studyswap-config`: `PORT`, `DB_FILE`, `FILES_DIR`, `RATE_LIMIT_MAX` |
+| `studyswap-pvc.yaml` | PVC `studyswap-data` 1Gi, `ReadWriteOnce` — для файлу SQLite і завантажених файлів |
+| `studyswap-deployment.yaml` | Deployment `studyswap-api`: 1 репліка, `strategy: Recreate`, readiness `/health`, liveness `tcpSocket :3000` |
+| `studyswap-service.yaml` | Service `studyswap-api` типу ClusterIP: `80 → 3000` |
+
+Secret із `JWT_SECRET` у git не комітиться — створюється командою `kubectl create secret` (крок 4).
+
+### 1. Docker-образ бекенду і перевірка без Kubernetes
+
+Образ збирається з наявного `backend/Dockerfile` StudySwap (двоетапна збірка, `HEALTHCHECK` на `/health`). Порт 3001 на хості — бо 3000 зайнятий `docker compose` проєкту.
+
+Вміст `backend/Dockerfile`:
+
+```dockerfile
+# Образ бекенду StudySwap (Express + SQLite). Два етапи (multi-stage build).
+# better-sqlite3 13 вимагає Node >= 22 і компілюється під час npm ci (готової збірки під Linux немає).
+
+# ---------- Етап 1: збирання залежностей ----------
+# Тут є Python, make і g++, потрібні для компіляції better-sqlite3
+FROM node:22-bookworm-slim AS deps
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 make g++ \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Залежності окремим шаром: якщо package*.json не змінився, Docker бере їх з кешу
+COPY package*.json ./
+RUN npm ci --omit=dev
+
+# ---------- Етап 2: робочий образ ----------
+# Без компіляторів: лише Node.js, готові node_modules і код
+FROM node:22-bookworm-slim
+
+WORKDIR /app
+
+# Порт сервера (backend/config.js читає PORT). Інші налаштування — через docker run -e:
+# CHAOS=1, REQUEST_TIMEOUT_MS, RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX
+ENV PORT=3000
+
+COPY --from=deps /app/node_modules ./node_modules
+# Код застосунку (що не копіювати — див. .dockerignore)
+COPY . .
+
+EXPOSE 3000
+
+# Docker сам перевіряє GET /health; стан видно в `docker ps` (healthy / unhealthy)
+HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=3 \
+  CMD node -e "fetch('http://localhost:' + process.env.PORT + '/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+
+CMD ["node", "server.js"]
+```
+
+```powershell
+cd E:\projects\StudySwap
+docker build -t studyswap-api:1.0.0 ./backend
+docker run -d --name studyswap-test -p 3001:3000 studyswap-api:1.0.0
+curl.exe -i http://localhost:3001/health
+docker rm -f studyswap-test
+```
+
+```
+ => => naming to docker.io/library/studyswap-api:1.0.0
+6883e4eb66ccc6c8fd313206fa29b9f84df042effc7773527aab5c74a77ce547
+
+HTTP/1.1 200 OK
+X-Powered-By: Express
+X-Request-Id: ac946242-ba48-477b-ba8b-7d75c0d44fce
+Content-Type: application/json; charset=utf-8
+Content-Length: 42
+
+{"status":"ok","checks":{"database":"ok"}}
+studyswap-test
+```
+
+**Відхилення від умови:** в умові базовий образ `node:20`, у нас `node:22-bookworm-slim`. Бібліотека `better-sqlite3` 13 (драйвер SQLite) вимагає Node.js ≥ 22, тому на `node:20` бекенд не збирається. Dockerfile проєкту не змінювали.
+
+### 2. Minikube і namespace
+
+```powershell
+minikube start --driver=docker --memory=3072
+kubectl config current-context
+kubectl apply -f k8s/namespace.yaml
+kubectl get ns k8s-demo
+```
+
+```
+😄  minikube v1.39.0 на Microsoft Windows 11 Pro 26H2
+📦  Підготовка Kubernetes v1.37.0 у containerd 2.3.4 ...
+🌟  Увімкнені надбудови: storage-provisioner, default-storageclass
+🏄  Готово! kubectl налаштовано на стандартне використання кластера "minikube"
+
+minikube
+
+namespace/k8s-demo created
+
+NAME       STATUS   AGE
+k8s-demo   Active   3m41s
+```
+
+`default-storageclass` важливий для нас: саме він автоматично створює том під PVC.
+
+### 3. Образ у Minikube
+
+Minikube має власний runtime (containerd) і не бачить образів з Docker Desktop, а в Docker Hub образу `studyswap-api` немає. Тому образ завантажено в кластер, а в Deployment стоїть `imagePullPolicy: IfNotPresent`.
+
+```powershell
+minikube image load studyswap-api:1.0.0
+minikube image ls | Select-String studyswap
+```
+
+```
+docker.io/library/studyswap-api:1.0.0
+```
+
+### 4. Secret, ConfigMap, PVC, Deployment, Service
+
+```powershell
+kubectl create secret generic studyswap-secret -n k8s-demo --from-literal=JWT_SECRET=lab10-k8s-secret
+kubectl apply -f k8s/studyswap-configmap.yaml
+kubectl apply -f k8s/studyswap-pvc.yaml
+kubectl apply -f k8s/studyswap-deployment.yaml
+kubectl apply -f k8s/studyswap-service.yaml
+kubectl rollout status deployment/studyswap-api -n k8s-demo
+kubectl get pods -n k8s-demo -l app=studyswap-api
+kubectl get pvc -n k8s-demo
+kubectl get svc studyswap-api -n k8s-demo
+kubectl get endpoints studyswap-api -n k8s-demo
+```
+
+```
+secret/studyswap-secret created
+configmap/studyswap-config created
+persistentvolumeclaim/studyswap-data created
+deployment.apps/studyswap-api created
+service/studyswap-api created
+Waiting for deployment "studyswap-api" rollout to finish: 0 of 1 updated replicas are available...
+deployment "studyswap-api" successfully rolled out
+
+NAME                             READY   STATUS    RESTARTS   AGE
+studyswap-api-6cd555d9b-rwnnm    1/1     Running   0          6s
+
+NAME             STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS
+studyswap-data   Bound    pvc-39a5c282-73ee-47ee-891d-058211690eb9   1Gi        RWO            standard
+
+NAME            TYPE        CLUSTER-IP       EXTERNAL-IP   PORT(S)   AGE
+studyswap-api   ClusterIP   10.111.191.170   <none>        80/TCP    2m12s
+
+Warning: v1 Endpoints is deprecated in v1.33+; use discovery.k8s.io/v1 EndpointSlice
+NAME            ENDPOINTS         AGE
+studyswap-api   10.244.0.3:3000   2m13s
+```
+
+Service знайшов Pod за selector-ом `app=studyswap-api`: endpoint `10.244.0.3:3000`. Попередження про `Endpoints` — лише про застарілий API; новий спосіб — `kubectl get endpointslices -n k8s-demo`.
+
+Чому маніфест саме такий:
+
+- **1 репліка + `strategy: Recreate`.** У файл SQLite одночасно може писати лише один процес. За стандартного RollingUpdate новий Pod стартує раніше, ніж зупиняється старий, і на мить було б два записувачі в одну базу. Recreate спочатку зупиняє старий Pod.
+- **PVC `ReadWriteOnce`.** База й завантажені файли лежать у `/app/data` на томі, а не у файловій системі контейнера, тому переживають перезапуск Pod-а.
+- **Readiness = `GET /health`** (перевіряє сервер і базу; поки 503 — Pod не отримує трафік). **Liveness = `tcpSocket :3000`** — лише чи процес живий. Якби liveness теж ходив у `/health`, збій бази спричинив би нескінченні рестарти здорового контейнера (як і пише Розробник 1 у відповіді b).
+- **`terminationGracePeriodSeconds: 10`.** `server.js` StudySwap не обробляє SIGTERM (знахідка Розробника 1 з рівня 75), тож без цього kubelet чекав би 30 с перед SIGKILL на кожному rollout.
+
+### 5. Доступ через Service і port-forward
+
+Вікно 1:
+
+```powershell
+kubectl port-forward svc/studyswap-api 8082:80 -n k8s-demo
+```
+
+```
+Forwarding from 127.0.0.1:8082 -> 3000
+Forwarding from [::1]:8082 -> 3000
+Handling connection for 8082
+```
+
+Вікно 2:
+
+```powershell
+curl.exe -i http://localhost:8082/health
+curl.exe -s "http://localhost:8082/materials?page=1"
+```
+
+```
+HTTP/1.1 200 OK
+X-Powered-By: Express
+X-Request-Id: dce5f7ec-1106-4d7c-bb98-16c30117b370
+Content-Type: application/json; charset=utf-8
+
+{"status":"ok","checks":{"database":"ok"}}
+
+{"items":[{"id":1,"title":"Нормалізація БД","subject":"Бази даних","university":"КПІ","course":2,"type":"конспект",...},
+ {"id":2,"title":"Принципи ООП",...},{"id":3,"title":"Приклади екзаменаційних питань з БД",...}],
+ "total":3,"page":1,"degraded":false}
+```
+
+Шлях запиту: `localhost:8082` → kubectl → API-сервер → kubelet → Pod `studyswap-api` `:3000` (Service `80 → 3000` використано для вибору Pod-а і перекладу порту).
+
+### 6. ConfigMap і `rollout restart`
+
+Для перевірки змінено `RATE_LIMIT_MAX` — ліміт запитів з одного IP за 10 с (з `"50"` на `"3"`), бо результат видно ззовні: після ліміту сервер відповідає `429`.
+
+```powershell
+kubectl apply -f k8s/studyswap-configmap.yaml
+kubectl exec deploy/studyswap-api -n k8s-demo -- printenv RATE_LIMIT_MAX
+kubectl rollout restart deployment/studyswap-api -n k8s-demo
+kubectl rollout status deployment/studyswap-api -n k8s-demo
+kubectl get pods -n k8s-demo -l app=studyswap-api
+kubectl exec deploy/studyswap-api -n k8s-demo -- printenv RATE_LIMIT_MAX
+```
+
+```
+configmap/studyswap-config configured
+50
+deployment.apps/studyswap-api restarted
+Waiting for deployment "studyswap-api" rollout to finish: 0 out of 1 new replicas have been updated...
+Waiting for deployment "studyswap-api" rollout to finish: 0 of 1 updated replicas are available...
+deployment "studyswap-api" successfully rolled out
+NAME                             READY   STATUS    RESTARTS   AGE
+studyswap-api-8456758d9c-hqvfm   1/1     Running   0          7s
+3
+```
+
+Після `apply` ConfigMap у кластері вже новий, але Pod досі бачить `50`: env читаються лише під час старту контейнера. Після `rollout restart` створено новий Pod (`...-hqvfm` замість `...-txhmv`), і він бачить `3`.
+
+Перевірка ліміту (port-forward перезапущено, бо старий Pod видалено):
+
+```powershell
+1..5 | % { curl.exe -s -o NUL -w "%{http_code}`n" http://localhost:8082/materials }
+```
+
+```
+200
+200
+200
+429
+429
+```
+
+Після перевірки повернуто `RATE_LIMIT_MAX: "50"` (`apply` + `rollout restart`), у git — файл зі значенням 50.
+
+#### Знахідка: `configmap ... unchanged`
+
+Перша спроба дала `configmap/studyswap-config unchanged`, і після restart Pod так само бачив `50`. Причина — зміна у файлі не була збережена. Корисний висновок: `kubectl apply` порівнює файл зі станом у кластері, і `unchanged` — сигнал перевірити сам файл (`Select-String RATE_LIMIT k8s\studyswap-configmap.yaml`), а не перезапускати Pod-и.
+
+### Підсумок рівня 100
+
+| Вимога | Результат |
+|---|---|
+| Свій Minikube і namespace `k8s-demo` | Minikube 1.39.0 / Kubernetes 1.37.0, namespace `Active` |
+| Dockerfile бекенду, `docker build`, `docker run`, `curl /health` | `200 OK`, `{"status":"ok","checks":{"database":"ok"}}` |
+| `studyswap-deployment.yaml` (1 репліка) і `studyswap-service.yaml` (ClusterIP 80 → 3000) | Pod `1/1 Running`, endpoint `10.244.0.3:3000` |
+| port-forward на 8082, `curl /health` | `200 OK`, каталог з 3 матеріалами |
+| ConfigMap + `rollout restart` | `50` → `3` лише після restart, ліміт дав `429` |
+
+Додатково до умови: PVC для SQLite, Secret для `JWT_SECRET`, `Recreate`, окремі readiness / liveness.
