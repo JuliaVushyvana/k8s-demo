@@ -2,10 +2,10 @@
 
 Fork: https://github.com/JuliaVushyvana/k8s-demo
 
-| Рівень | Хто | Розділ |
-|---|---|---|
-| 60, 75, 90 | Розробник 1 | нижче |
-| 100 (StudySwap у Kubernetes) | Розробник 2 | [розділ 100](#100-балів-studyswap-у-kubernetes) |
+| Рівень | Розділ |
+|---|---|
+| 60, 75, 90 | нижче |
+| 100 (StudySwap у Kubernetes) | [розділ 100](#100-балів-studyswap-у-kubernetes) |
 
 Середовище: macOS (arm64), Docker Desktop 29.9.3, Node.js 24, kubectl 1.36, Minikube 1.39 (Kubernetes 1.37, runtime containerd).
 
@@ -630,8 +630,8 @@ Service знайшов Pod за selector-ом `app=studyswap-api`: endpoint `10.
 
 - **1 репліка + `strategy: Recreate`.** У файл SQLite одночасно може писати лише один процес. За стандартного RollingUpdate новий Pod стартує раніше, ніж зупиняється старий, і на мить було б два записувачі в одну базу. Recreate спочатку зупиняє старий Pod.
 - **PVC `ReadWriteOnce`.** База й завантажені файли лежать у `/app/data` на томі, а не у файловій системі контейнера, тому переживають перезапуск Pod-а.
-- **Readiness = `GET /health`** (перевіряє сервер і базу; поки 503 — Pod не отримує трафік). **Liveness = `tcpSocket :3000`** — лише чи процес живий. Якби liveness теж ходив у `/health`, збій бази спричинив би нескінченні рестарти здорового контейнера (як і пише Розробник 1 у відповіді b).
-- **`terminationGracePeriodSeconds: 10`.** `server.js` StudySwap не обробляє SIGTERM (знахідка Розробника 1 з рівня 75), тож без цього kubelet чекав би 30 с перед SIGKILL на кожному rollout.
+- **Readiness = `GET /health`** (перевіряє сервер і базу; поки 503 — Pod не отримує трафік). **Liveness = `tcpSocket :3000`** — лише чи процес живий. Якби liveness теж ходив у `/health`, збій бази спричинив би нескінченні рестарти здорового контейнера (див. контрольні запитання, відповідь b).
+- **`terminationGracePeriodSeconds: 10`.** `server.js` StudySwap не обробляє SIGTERM (знахідка з рівня 75), тож без цього kubelet чекав би 30 с перед SIGKILL на кожному rollout.
 
 ### 5. Доступ через Service і port-forward
 
